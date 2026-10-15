@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TicketPulse | 04 alerting - SQS->n8n forwarder Lambda (partial-batch failures, DLQ),
+  scheduled KPI snapshot Lambda (Redshift Data API -> SQS) for LLM payment insights, and
+  CloudWatch alarms for pipeline health.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ticketpulse
+  InsightsSchedule:
+    Type: String
+    Default: rate(1 hour)
+    Description: How often a KPI snapshot is sent to n8n for LLM-generated payment insights.
+  KpiLookbackMinutes:
+    Type: Number
+    Default: 60
+  OpsEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for CloudWatch alarm notifications (confirm the SNS subscription).
+
+Conditions:
+  HasOpsEmail: !Not [!Equals [!Ref OpsEmail, ""]]
+
+Resources:
+  # ---------------- SQS -> n8n forwarder ----------------
+  ForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: consume-alerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility]
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueArn" }
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-N8nSecretArn" }
+
+  ForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-sqs-to-n8n"
+      Description: Delivers buffered alerts / KPI snapshots from SQS to n8n webhooks
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt ForwarderRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        S3Bucket: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        S3Key: lambda/sqs_to_n8n.zip
+      Environment:
+        Variables:
+          N8N_SECRET_ARN: !ImportValue { "Fn::Sub": "${ProjectName}-N8nSecretArn" }
+          HTTP_TIMEOUT_SECONDS: "10"
+
+  ForwarderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-sqs-to-n8n"
+      RetentionInDays: 14
+
+  ForwarderEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueArn" }
+      FunctionName: !Ref ForwarderFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      Enabled: true
+
+  # ---------------- KPI snapshot (for LLM insights) ----------------
+  KpiSnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: query-redshift-and-enqueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [redshift-data:ExecuteStatement, redshift-data:BatchExecuteStatement]
+                Resource: !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+              - Effect: Allow
+                Action: [redshift-data:DescribeStatement, redshift-data:GetStatementResult]
+                Resource: "*"
+              - Effect: Allow
+                Action: redshift-serverless:GetCredentials
+                Resource: "*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftSecretArn" }
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueArn" }
+
+  KpiSnapshotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-kpi-snapshot"
+      Description: Aggregates payment KPIs in Redshift and enqueues them for LLM insights in n8n
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt KpiSnapshotRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        S3Bucket: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        S3Key: lambda/kpi_snapshot.zip
+      Environment:
+        Variables:
+          REDSHIFT_WORKGROUP: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftWorkgroup" }
+          REDSHIFT_DB: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftDb" }
+          REDSHIFT_SECRET_ARN: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftSecretArn" }
+          ALERTS_QUEUE_URL: !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueUrl" }
+          LOOKBACK_MINUTES: !Ref KpiLookbackMinutes
+
+  KpiSnapshotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-kpi-snapshot"
+      RetentionInDays: 14
+
+  KpiSnapshotSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-kpi-snapshot"
+      ScheduleExpression: !Ref InsightsSchedule
+      State: ENABLED
+      Targets:
+        - Id: kpi-snapshot
+          Arn: !GetAtt KpiSnapshotFunction.Arn
+
+  KpiSnapshotInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KpiSnapshotFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KpiSnapshotSchedule.Arn
+
+  # ---------------- Pipeline health alarms ----------------
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-ops"
+      Subscription: !If
+        - HasOpsEmail
+        - [{ Protocol: email, Endpoint: !Ref OpsEmail }]
+        - !Ref AWS::NoValue
+
+  KinesisIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-kinesis-consumer-lag"
+      AlarmDescription: Glue streaming job is falling behind the stream (> 5 minutes)
+      Namespace: AWS/Kinesis
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Dimensions:
+        - Name: StreamName
+          Value: !ImportValue { "Fn::Sub": "${ProjectName}-StreamName" }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 300000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  AlertsDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alerts-dlq-not-empty"
+      AlarmDescription: Alerts could not be delivered to n8n after 5 attempts - check the webhook
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub "${ProjectName}-alerts-dlq.fifo"
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  RejectedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-rejected-events"
+      AlarmDescription: More than 5% of events failed validation in the last 5 minutes
+      Metrics:
+        - Id: rejected
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: TicketPulse, MetricName: RejectedEvents }
+            Period: 300
+            Stat: Sum
+        - Id: processed
+          ReturnData: false
+          MetricStat:
+            Metric: { Namespace: TicketPulse, MetricName: ProcessedEvents }
+            Period: 300
+            Stat: Sum
+        - Id: reject_rate
+          Expression: "IF(processed > 0, rejected / processed, 0)"
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 0.05
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+Outputs:
+  ForwarderFunctionName:
+    Value: !Ref ForwarderFunction
+  KpiSnapshotFunctionName:
+    Value: !Ref KpiSnapshotFunction
+  OpsTopicArn:
+    Value: !Ref OpsTopic

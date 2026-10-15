@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TicketPulse | 03 glue - Glue Data Catalog table over the Kinesis stream (the event contract),
+  a VPC JDBC connection to Redshift Serverless that reads credentials from Secrets Manager,
+  and the Glue Streaming ETL job (Spark Structured Streaming).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ticketpulse
+  GlueVersion:
+    Type: String
+    Default: "4.0"
+    Description: Glue runtime for the streaming job (4.0 = Spark 3.3 / Python 3.10).
+  WorkerType:
+    Type: String
+    Default: G.025X
+    AllowedValues: [G.025X, G.1X, G.2X]
+    Description: G.025X (0.25 DPU) is the low-cost worker type built for streaming jobs.
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+  MicroBatchWindowSeconds:
+    Type: Number
+    Default: 60
+  FailureRateThreshold:
+    Type: String
+    Default: "0.25"
+    Description: Alert when a gateway's payment failure rate in one micro-batch exceeds this.
+  MinPaymentsForAlert:
+    Type: Number
+    Default: 20
+  HighValueAmountInr:
+    Type: Number
+    Default: 25000
+
+Resources:
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_streaming"
+        Description: Streaming sources for TicketPulse
+
+  # The event contract. Every event is a flat envelope; booking events carry the full booking
+  # snapshot and payment events the full payment snapshot (event-carried state transfer), so the
+  # consumer can rebuild current state from any single event.
+  KinesisEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: ticket_events
+        TableType: EXTERNAL_TABLE
+        Parameters: { classification: json }
+        StorageDescriptor:
+          Location: !ImportValue { "Fn::Sub": "${ProjectName}-StreamName" }
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo: { SerializationLibrary: org.openx.data.jsonserde.JsonSerDe }
+          Parameters:
+            typeOfData: kinesis
+            streamARN: !ImportValue { "Fn::Sub": "${ProjectName}-StreamArn" }
+            endpointUrl: !Sub "https://kinesis.${AWS::Region}.amazonaws.com"
+          Columns:
+            - { Name: event_id, Type: string }
+            - { Name: event_type, Type: string }
+            - { Name: event_time, Type: string }
+            - { Name: schema_version, Type: int }
+            - { Name: source, Type: string }
+            - { Name: booking_id, Type: string }
+            - { Name: user_id, Type: string }
+            - { Name: event_name, Type: string }
+            - { Name: event_category, Type: string }
+            - { Name: venue_city, Type: string }
+            - { Name: show_time, Type: string }
+            - { Name: seats, Type: int }
+            - { Name: ticket_amount, Type: double }
+            - { Name: booking_status, Type: string }
+            - { Name: payment_id, Type: string }
+            - { Name: payment_method, Type: string }
+            - { Name: gateway, Type: string }
+            - { Name: payment_status, Type: string }
+            - { Name: amount, Type: double }
+            - { Name: currency, Type: string }
+            - { Name: failure_code, Type: string }
+            - { Name: refund_amount, Type: double }
+
+  RedshiftConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub "${ProjectName}-redshift"
+        ConnectionType: JDBC
+        Description: Redshift Serverless via private subnet; credentials from Secrets Manager
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Sub
+            - "jdbc:redshift://${Endpoint}:5439/${Db}"
+            - Endpoint: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftEndpoint" }
+              Db: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftDb" }
+          SECRET_ID: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftSecretArn" }
+          JDBC_ENFORCE_SSL: "true"
+        PhysicalConnectionRequirements:
+          SubnetId: !ImportValue { "Fn::Sub": "${ProjectName}-PrivateSubnetA" }
+          AvailabilityZone: !ImportValue { "Fn::Sub": "${ProjectName}-PrivateSubnetAAz" }
+          SecurityGroupIdList:
+            - !ImportValue { "Fn::Sub": "${ProjectName}-GlueSgId" }
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-streaming"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: ticketpulse-streaming
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadKinesis
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-StreamArn" }
+              - Sid: KinesisKms
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+                Condition:
+                  StringEquals: { "kms:ViaService": !Sub "kinesis.${AWS::Region}.amazonaws.com" }
+              - Sid: RawArchiveWrite
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject]
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue { "Fn::Sub": "${ProjectName}-RawBucket" }
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue { "Fn::Sub": "${ProjectName}-RawBucket" }
+              - Sid: ArtifactsCheckpointsTemp
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:DeleteObject]
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${B}"
+                    - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+                  - !Sub
+                    - "arn:aws:s3:::${B}/*"
+                    - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+              - Sid: RedshiftSecret
+                Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftSecretArn" }
+              - Sid: PassRedshiftRoleForCopy
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftS3RoleArn" }
+              - Sid: SendAlerts
+                Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+                Resource: !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueArn" }
+              - Sid: CustomMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": TicketPulse }
+
+  StreamingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-streaming-etl"
+      Description: Kinesis -> validate/dedupe -> S3 raw archive + Redshift Serverless upserts + SQS alerts
+      Role: !GetAtt GlueJobRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      MaxRetries: 1
+      ExecutionProperty: { MaxConcurrentRuns: 1 }
+      Connections: { Connections: [!Ref RedshiftConnection] }
+      Command:
+        Name: gluestreaming
+        PythonVersion: "3"
+        ScriptLocation: !Sub
+          - "s3://${B}/glue/streaming_job.py"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+      DefaultArguments:
+        "--job-language": python
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--enable-observability-metrics": "true"
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub
+          - "s3://${B}/glue/spark-ui/"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        "--TempDir": !Sub
+          - "s3://${B}/glue/temp/"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        "--extra-py-files": !Sub
+          - "s3://${B}/glue/ticket_etl.zip"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        "--SOURCE_DATABASE": !Ref GlueDatabase
+        "--SOURCE_TABLE": ticket_events
+        "--RAW_BUCKET": !ImportValue { "Fn::Sub": "${ProjectName}-RawBucket" }
+        "--CHECKPOINT_PATH": !Sub
+          - "s3://${B}/glue/checkpoints/streaming-etl/"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        "--REDSHIFT_TMP_DIR": !Sub
+          - "s3://${B}/redshift-tmp/"
+          - B: !ImportValue { "Fn::Sub": "${ProjectName}-ArtifactsBucket" }
+        "--REDSHIFT_CONNECTION": !Ref RedshiftConnection
+        "--REDSHIFT_DB": !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftDb" }
+        "--REDSHIFT_IAM_ROLE": !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftS3RoleArn" }
+        "--ALERTS_QUEUE_URL": !ImportValue { "Fn::Sub": "${ProjectName}-AlertsQueueUrl" }
+        "--WINDOW_SECONDS": !Ref MicroBatchWindowSeconds
+        "--FAILURE_RATE_THRESHOLD": !Ref FailureRateThreshold
+        "--MIN_PAYMENTS_FOR_ALERT": !Ref MinPaymentsForAlert
+        "--HIGH_VALUE_AMOUNT": !Ref HighValueAmountInr
+        "--STARTING_POSITION": TRIM_HORIZON
+
+Outputs:
+  StreamingJobName:
+    Value: !Ref StreamingJob
+    Export: { Name: !Sub "${ProjectName}-GlueJobName" }
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase

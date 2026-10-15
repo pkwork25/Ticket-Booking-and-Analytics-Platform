@@ -1,0 +1,236 @@
+{
+  "name": "TicketPulse - Real-time payment alerts",
+  "nodes": [
+    {
+      "id": "c27b5c35-b996-500d-be1d-fb21cd7ef924",
+      "name": "Alert webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticketpulse-alerts",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "5bd30a31-5b16-5c3e-a5d5-0efaf6aff957",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "TicketPulse webhook token"
+        }
+      }
+    },
+    {
+      "id": "fcb21dd4-3bf5-5f94-9644-097ad1f5ff93",
+      "name": "Normalize + dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- edit these once after import ----\nconst CONFIG = {\n  model: 'anthropic/claude-sonnet-5',            // any OpenRouter model id\n  fallbackModels: ['anthropic/claude-sonnet-4.6'], // OpenRouter tries these if the first is down\n  telegramChatId: 'YOUR_TELEGRAM_CHAT_ID',\n};\n\n// Webhook payload = alert published by the Glue streaming job (via SQS -> Lambda).\n// De-duplicate on alert_id for 6 hours: SQS/Lambda delivery is at-least-once.\nconst staticData = $getWorkflowStaticData('global');\nstaticData.seen = staticData.seen || {};\nconst now = Date.now();\nfor (const [k, ts] of Object.entries(staticData.seen)) if (now - ts > 6 * 3600e3) delete staticData.seen[k];\n\nconst out = [];\nfor (const item of $input.all()) {\n  const a = item.json.body || item.json;\n  const id = a.alert_id || item.json.headers?.['idempotency-key'];\n  if (!a.rule || (id && staticData.seen[id])) continue;\n  if (id) staticData.seen[id] = now;\n  out.push({ json: { alert: a, config: CONFIG,\n    needs_triage: ['PAYMENT_FAILURE_SPIKE', 'PAYMENT_METHOD_DEGRADED'].includes(a.rule) } });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "aa062a3e-2579-5e35-a16e-141fdc151571",
+      "name": "Needs LLM triage?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "49e526fb-f762-5b32-bac1-2e33258cf136",
+              "leftValue": "={{ $json.needs_triage }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "fb609808-002b-548e-a949-40c358a3d71f",
+      "name": "OpenRouter - triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "HTTP-Referer",
+              "value": "https://github.com/your-user/realtime-ticket-payments-aws"
+            },
+            {
+              "name": "X-Title",
+              "value": "TicketPulse"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: $json.config.model,\n  models: [$json.config.model, ...$json.config.fallbackModels],\n  temperature: 0.2,\n  max_tokens: 500,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content: 'You are the on-call payments analyst for an Indian event-ticketing platform (UPI, cards, netbanking, wallets; gateways razorpay, payu, cashfree, ccavenue). You receive one automated alert computed from a 1-minute window of live payment events. Reply ONLY with JSON: {\"title\": string (max 80 chars), \"likely_causes\": [up to 3 short strings], \"customer_impact\": string, \"next_actions\": [up to 3 concrete steps for the ops team], \"escalate\": boolean}. Use only the numbers in the alert; never invent figures. Prefer gateway-side causes for GATEWAY_TIMEOUT / GATEWAY_5XX codes and bank/NPCI-side causes for UPI or BANK_* codes.' },\n    { role: 'user', content: JSON.stringify($json.alert) }\n  ]\n}) }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "OpenRouter API key (Authorization: Bearer)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "8389240c-d5d6-5afb-8eeb-c1e161e2a840",
+      "name": "Format Telegram message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst results = [];\nconst inputs = $input.all();\nfor (let i = 0; i < inputs.length; i++) {\n  // Items arrive either straight from 'Needs LLM triage?' (false branch) or from OpenRouter;\n  // for the latter, walk the paired-item lineage back to the normalized alert.\n  const base = inputs[i].json.alert ? inputs[i].json : ($('Normalize + dedupe').itemMatching(i)?.json ?? {});\n  const a = base.alert || {};\n  let triage = null;\n  const content = inputs[i].json.choices?.[0]?.message?.content;\n  if (content) { try { triage = JSON.parse(content); } catch (e) { triage = { title: content.slice(0, 200) }; } }\n\n  const icon = a.severity === 'critical' ? '🔴' : '🟠';\n  const m = a.metrics || {};\n  let text = `${icon} <b>${esc(a.rule)}</b> (${esc(a.severity)})\\n${esc(a.summary)}\\n`;\n  text += `<i>window ${esc(a.window_start)} · ${esc(a.dimension)}</i>\\n`;\n  if (m.top_failure_code) text += `top failure: <code>${esc(m.top_failure_code)}</code>\\n`;\n  if (triage) {\n    text += `\\n🤖 <b>${esc(triage.title || 'LLM triage')}</b>\\n`;\n    for (const c of (triage.likely_causes || [])) text += `• ${esc(c)}\\n`;\n    if (triage.customer_impact) text += `Impact: ${esc(triage.customer_impact)}\\n`;\n    for (const s of (triage.next_actions || [])) text += `→ ${esc(s)}\\n`;\n    if (triage.escalate) text += `\\n⚠️ <b>Escalate to gateway / bank partner</b>`;\n  } else if (base.needs_triage) {\n    text += `\\n(LLM triage unavailable - raw alert only)`;\n  }\n  results.push({ json: { chat_id: base.config?.telegramChatId, text, silent: a.severity !== 'critical' } });\n}\nreturn results;"
+      }
+    },
+    {
+      "id": "3356a8bc-96fc-5dcc-b070-6de1cf9cc344",
+      "name": "Send alert to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_notification": "={{ $json.silent }}"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "TicketPulse Telegram bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Alert webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize + dedupe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize + dedupe": {
+      "main": [
+        [
+          {
+            "node": "Needs LLM triage?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs LLM triage?": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter - triage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Telegram message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter - triage": {
+      "main": [
+        [
+          {
+            "node": "Format Telegram message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Telegram message": {
+      "main": [
+        [
+          {
+            "node": "Send alert to Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

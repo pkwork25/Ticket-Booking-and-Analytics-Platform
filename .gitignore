@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.pyc
+.venv/
+.env
+n8n/.env
+.pytest_cache/
+.ruff_cache/
+sample_events.jsonl

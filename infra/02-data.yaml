@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TicketPulse | 02 data - Kinesis Data Stream, S3 raw archive + artifacts buckets, SQS FIFO alert
+  buffer with DLQ, Secrets Manager secrets, and Redshift Serverless (namespace + workgroup) in the
+  private subnets of the 01-network stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ticketpulse
+  KinesisShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: 1 shard = 1 MB/s or 1,000 records/s in. Plenty for the simulator.
+  RedshiftBaseRpu:
+    Type: Number
+    Default: 4
+    AllowedValues: [4, 8, 16, 32]
+    Description: 4 RPU is the smallest (cheapest) base capacity; available in ap-south-1 and most regions.
+  RedshiftMaxRpu:
+    Type: Number
+    Default: 16
+    Description: Cost ceiling - the workgroup never scales past this.
+  RedshiftDbName:
+    Type: String
+    Default: ticketdb
+  RedshiftAdminUser:
+    Type: String
+    Default: tp_admin
+  RawRetentionDays:
+    Type: Number
+    Default: 365
+
+Resources:
+  # ---------------- Kinesis ----------------
+  EventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-events"
+      StreamModeDetails: { StreamMode: PROVISIONED }
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 24
+      StreamEncryption: { EncryptionType: KMS, KeyId: alias/aws/kinesis }
+
+  # ---------------- S3 ----------------
+  RawArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      LifecycleConfiguration:
+        Rules:
+          - Id: tier-raw-events
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: GLACIER_IR, TransitionInDays: 90 }
+            ExpirationInDays: !Ref RawRetentionDays
+          - Id: expire-quarantine
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 30
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-redshift-temp
+            Status: Enabled
+            Prefix: redshift-tmp/
+            ExpirationInDays: 2
+
+  # ---------------- SQS (alert / insight buffer) ----------------
+  AlertsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-alerts-dlq.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AlertsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-alerts.fifo"
+      FifoQueue: true
+      # Producers set a deterministic MessageDeduplicationId, so a replayed micro-batch
+      # (Glue retry / checkpoint replay) cannot raise the same alert twice within 5 minutes.
+      ContentBasedDeduplication: false
+      DeduplicationScope: messageGroup
+      FifoThroughputLimit: perMessageGroupId
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AlertsDlq.Arn
+        maxReceiveCount: 5
+
+  # ---------------- Secrets ----------------
+  RedshiftAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/redshift/admin"
+      Description: Redshift Serverless admin credentials (used by Glue connection + Data API)
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${RedshiftAdminUser}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: "\"'@/\\ `"
+        RequireEachIncludedType: true
+
+  N8nWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/n8n/webhook"
+      Description: >
+        n8n webhook URLs + shared header token used by the SQS->n8n forwarder Lambda.
+        Update the URLs after importing the n8n workflows (scripts/set_n8n_secret.sh).
+      GenerateSecretString:
+        SecretStringTemplate: '{"alerts_url": "https://CHANGE-ME/webhook/ticketpulse-alerts", "insights_url": "https://CHANGE-ME/webhook/ticketpulse-insights", "header_name": "X-TicketPulse-Token"}'
+        GenerateStringKey: token
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  # ---------------- Redshift Serverless ----------------
+  RedshiftS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-redshift-s3"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [redshift.amazonaws.com, redshift-serverless.amazonaws.com] }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: copy-from-staging-and-raw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/redshift-tmp/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt RawArchiveBucket.Arn
+                  - !Sub "${RawArchiveBucket.Arn}/raw/*"
+
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${ProjectName}-ns"
+      DbName: !Ref RedshiftDbName
+      AdminUsername: !Sub "{{resolve:secretsmanager:${RedshiftAdminSecret}:SecretString:username}}"
+      AdminUserPassword: !Sub "{{resolve:secretsmanager:${RedshiftAdminSecret}:SecretString:password}}"
+      IamRoles: [!GetAtt RedshiftS3Role.Arn]
+      DefaultIamRoleArn: !GetAtt RedshiftS3Role.Arn
+      LogExports: [userlog, connectionlog, useractivitylog]
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "${ProjectName}-wg"
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: !Ref RedshiftBaseRpu
+      MaxCapacity: !Ref RedshiftMaxRpu
+      PubliclyAccessible: false
+      EnhancedVpcRouting: false
+      SubnetIds:
+        - !ImportValue { "Fn::Sub": "${ProjectName}-PrivateSubnetA" }
+        - !ImportValue { "Fn::Sub": "${ProjectName}-PrivateSubnetB" }
+      SecurityGroupIds:
+        - !ImportValue { "Fn::Sub": "${ProjectName}-RedshiftSgId" }
+
+Outputs:
+  StreamName:
+    Value: !Ref EventStream
+    Export: { Name: !Sub "${ProjectName}-StreamName" }
+  StreamArn:
+    Value: !GetAtt EventStream.Arn
+    Export: { Name: !Sub "${ProjectName}-StreamArn" }
+  RawArchiveBucketName:
+    Value: !Ref RawArchiveBucket
+    Export: { Name: !Sub "${ProjectName}-RawBucket" }
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export: { Name: !Sub "${ProjectName}-ArtifactsBucket" }
+  AlertsQueueUrl:
+    Value: !Ref AlertsQueue
+    Export: { Name: !Sub "${ProjectName}-AlertsQueueUrl" }
+  AlertsQueueArn:
+    Value: !GetAtt AlertsQueue.Arn
+    Export: { Name: !Sub "${ProjectName}-AlertsQueueArn" }
+  AlertsDlqUrl:
+    Value: !Ref AlertsDlq
+  RedshiftSecretArn:
+    Value: !Ref RedshiftAdminSecret
+    Export: { Name: !Sub "${ProjectName}-RedshiftSecretArn" }
+  N8nWebhookSecretArn:
+    Value: !Ref N8nWebhookSecret
+    Export: { Name: !Sub "${ProjectName}-N8nSecretArn" }
+  RedshiftS3RoleArn:
+    Value: !GetAtt RedshiftS3Role.Arn
+    Export: { Name: !Sub "${ProjectName}-RedshiftS3RoleArn" }
+  RedshiftWorkgroupName:
+    Value: !Ref RedshiftWorkgroup
+    Export: { Name: !Sub "${ProjectName}-RedshiftWorkgroup" }
+  RedshiftDbName:
+    Value: !Ref RedshiftDbName
+    Export: { Name: !Sub "${ProjectName}-RedshiftDb" }
+  RedshiftEndpoint:
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
+    Export: { Name: !Sub "${ProjectName}-RedshiftEndpoint" }

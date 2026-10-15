@@ -1,0 +1,33 @@
+# Local n8n + a free Cloudflare quick tunnel so the AWS forwarder Lambda can reach your webhooks.
+#   cp n8n/.env.example n8n/.env   (set N8N_ENCRYPTION_KEY)
+#   docker compose -f n8n/docker-compose.yml --env-file n8n/.env up -d
+#   docker compose -f n8n/docker-compose.yml logs tunnel | grep trycloudflare.com   # your public URL
+# The quick-tunnel URL changes on every restart: rerun scripts/set_n8n_secret.sh with the new URL.
+# For a stable setup use n8n Cloud or a named Cloudflare tunnel instead.
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE:-Asia/Kolkata}
+      - TZ=${GENERIC_TIMEZONE:-Asia/Kolkata}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in n8n/.env}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=168
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    depends_on: [n8n]
+
+volumes:
+  n8n_data:

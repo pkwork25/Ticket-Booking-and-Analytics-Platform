@@ -1,0 +1,185 @@
+{
+  "name": "TicketPulse - LLM payment insights",
+  "nodes": [
+    {
+      "id": "437f4939-78bb-54ae-9dcf-d445f3be710a",
+      "name": "Insights webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticketpulse-insights",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "5eccf3cb-06ba-5171-ba96-66d9d059900c",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "TicketPulse webhook token"
+        }
+      }
+    },
+    {
+      "id": "4e800975-a825-5662-910b-2bec390bd813",
+      "name": "Build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- edit these once after import ----\nconst CONFIG = {\n  model: 'anthropic/claude-sonnet-5',            // any OpenRouter model id\n  fallbackModels: ['anthropic/claude-sonnet-4.6'], // OpenRouter tries these if the first is down\n  telegramChatId: 'YOUR_TELEGRAM_CHAT_ID',\n};\n\n// Payload = KPI snapshot assembled from Redshift by the kpi-snapshot Lambda (aggregates only, no PII).\nconst snap = $json.body || $json;\nconst system = [\n  'You are a senior payments analyst for an Indian event-ticketing platform.',\n  'You get an hourly KPI snapshot (INR) with the previous window for comparison.',\n  'Write for an ops/finance audience. Use ONLY numbers present in the snapshot; do not estimate or invent figures.',\n  'If attempts < 50, say volume is too low for firm conclusions.',\n  'Reply ONLY with JSON: {\"headline\": string, \"health\": \"green\"|\"amber\"|\"red\",',\n  ' \"key_findings\": [3-5 strings], \"anomalies\": [strings], \"recommended_actions\": [up to 3 strings],',\n  ' \"watch_next_hour\": string}.',\n  'Health: red if success rate < 85% or a gateway < 75%; amber if success rate dropped > 3 pts vs previous window; else green.'\n].join(' ');\nreturn [{ json: { snapshot: snap, config: CONFIG, body: {\n  model: CONFIG.model,\n  models: [CONFIG.model, ...CONFIG.fallbackModels],\n  temperature: 0.3,\n  max_tokens: 900,\n  response_format: { type: 'json_object' },\n  messages: [ { role: 'system', content: system }, { role: 'user', content: JSON.stringify(snap) } ],\n} } }];"
+      }
+    },
+    {
+      "id": "08905ffe-52bd-53f5-99fc-d9143d655cd0",
+      "name": "OpenRouter - insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "HTTP-Referer",
+              "value": "https://github.com/your-user/realtime-ticket-payments-aws"
+            },
+            {
+              "name": "X-Title",
+              "value": "TicketPulse"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 45000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "OpenRouter API key (Authorization: Bearer)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "205ee6f0-391c-5a16-ac60-7def6be61f60",
+      "name": "Parse + groundedness check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Parse the LLM answer and run a groundedness check: every number the model quotes must\n// exist in the snapshot (±0.5 or ±1%), otherwise it is flagged as unverified.\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst prev = $('Build prompt').first().json;\nconst snap = prev.snapshot;\nconst content = $json.choices?.[0]?.message?.content;\n\nconst known = [];\n(function walk(v) {\n  if (typeof v === 'number') known.push(v);\n  else if (Array.isArray(v)) v.forEach(walk);\n  else if (v && typeof v === 'object') Object.values(v).forEach(walk);\n})(snap);\nconst isKnown = n => known.some(k => Math.abs(k - n) <= Math.max(0.5, Math.abs(k) * 0.01))\n  || n === 1 || n === 2 || n === 3 || n === snap.lookback_minutes;\n\nlet r, parseError = null;\ntry { r = JSON.parse(content); } catch (e) { parseError = content ? 'invalid JSON from model' : 'no response from model'; }\n\nif (!r) {\n  const t = snap.totals || {};\n  const text = `📊 <b>TicketPulse payments - last ${snap.lookback_minutes} min</b>\\n` +\n    `Success rate ${t.success_rate_pct ?? '-'}% on ${t.attempts ?? 0} attempts · captured ₹${Math.round(t.captured_inr || 0).toLocaleString('en-IN')}\\n` +\n    `(LLM insights unavailable: ${esc(parseError)})`;\n  return [{ json: { chat_id: prev.config.telegramChatId, text, silent: true } }];\n}\n\nconst allText = [r.headline, ...(r.key_findings || []), ...(r.anomalies || []), ...(r.recommended_actions || []), r.watch_next_hour].join(' ');\nconst quoted = (allText.match(/-?\\d[\\d,]*\\.?\\d*/g) || []).map(s => parseFloat(s.replace(/,/g, ''))).filter(n => !isNaN(n));\nconst unverified = [...new Set(quoted.filter(n => !isKnown(n)))];\n\nconst icon = { green: '🟢', amber: '🟠', red: '🔴' }[r.health] || '⚪';\nlet text = `${icon} <b>${esc(r.headline)}</b>\\n<i>${esc(snap.window_start)} → ${esc(snap.window_end)}</i>\\n\\n`;\nfor (const f of r.key_findings || []) text += `• ${esc(f)}\\n`;\nif ((r.anomalies || []).length) { text += `\\n<b>Anomalies</b>\\n`; for (const a of r.anomalies) text += `⚠️ ${esc(a)}\\n`; }\nif ((r.recommended_actions || []).length) { text += `\\n<b>Actions</b>\\n`; for (const a of r.recommended_actions) text += `→ ${esc(a)}\\n`; }\nif (r.watch_next_hour) text += `\\n👀 ${esc(r.watch_next_hour)}\\n`;\nif (unverified.length) text += `\\n<i>Unverified numbers in LLM output: ${unverified.slice(0, 6).join(', ')}</i>`;\nreturn [{ json: { chat_id: prev.config.telegramChatId, text, silent: r.health === 'green',\n                  health: r.health, insights: r, unverified_numbers: unverified } }];"
+      }
+    },
+    {
+      "id": "70dc1297-b5ea-5fce-b745-b708b98ba5c0",
+      "name": "Send report to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML",
+          "disable_notification": "={{ $json.silent }}"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ME",
+          "name": "TicketPulse Telegram bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Insights webhook": {
+      "main": [
+        [
+          {
+            "node": "Build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build prompt": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter - insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter - insights": {
+      "main": [
+        [
+          {
+            "node": "Parse + groundedness check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + groundedness check": {
+      "main": [
+        [
+          {
+            "node": "Send report to Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
